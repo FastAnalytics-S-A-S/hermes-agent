@@ -24,7 +24,7 @@ import time
 import uuid
 from datetime import datetime, timezone, UTC
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # _resolve_request_profile result for a /p/<profile>/ prefix this gateway does not serve (-> 404);
 # distinct from None (no prefix / multiplexing off -> default profile).
@@ -2213,6 +2213,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             gateway_session_key=gateway_session_key, session_id=session_id)
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        if requested_toolsets:
+            # FastAnalytics (GabyPredice, "LA VOZ"): ya validado como
+            # SUBCONJUNTO del techo estático en el handler — aquí solo se aplica.
+            enabled_toolsets = sorted(set(requested_toolsets))
         # Same gate the messaging gateway and TUI apply: ``display.interim_assistant_messages``
         # off means no callback is installed, so mid-turn commentary never leaves the agent.
         if not resolve_display_setting(user_config, "api_server", "interim_assistant_messages", True):
@@ -2858,6 +2862,39 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 session_id=session_id, gateway_session_key=gateway_session_key,
                 requested_model=agent_overrides.get("requested_model"),
                 requested_provider=agent_overrides.get("requested_provider"), route=route)
+
+        # FastAnalytics (GabyPredice, "LA VOZ"): toolsets por petición.
+        # Subconjunto VALIDADO del techo estático de la plataforma; un nombre
+        # desconocido se rechaza con 400 (nunca se ignora en silencio). Sin
+        # este campo el comportamiento es el de siempre (config estática).
+        requested_toolset_names, toolsets_shape_err = _parse_request_toolsets(body)
+        if toolsets_shape_err is not None:
+            return web.json_response(
+                _openai_error(toolsets_shape_err, err_type="invalid_request_error"),
+                status=400,
+            )
+        if requested_toolset_names:
+            from gateway.run import _load_gateway_config
+            from hermes_cli.tools_config import (
+                _get_platform_tools,
+                enabled_mcp_server_names,
+            )
+
+            _toolsets_cfg = _load_gateway_config()
+            _toolsets_ceiling = set(_get_platform_tools(_toolsets_cfg, "api_server"))
+            _toolsets_mcp = set(enabled_mcp_server_names(_toolsets_cfg))
+            requested_toolsets, toolsets_err = _resolve_request_toolsets(
+                requested_toolset_names,
+                platform_enabled=_toolsets_ceiling,
+                mcp_enabled=_toolsets_mcp,
+            )
+            if toolsets_err is not None:
+                return web.json_response(
+                    _openai_error(toolsets_err, err_type="invalid_request_error"),
+                    status=400,
+                )
+            agent_overrides["requested_toolsets"] = requested_toolsets
+
             if selection_error:
                 return None, _error_response(selection_error, 400)
         run_kwargs = dict(
